@@ -15,9 +15,10 @@ kubectl create ns minio-operator
 kubectl apply -n minio-operator -f https://raw.githubusercontent.com/mattermost/mattermost-operator/master/docs/minio-operator/minio-operator.yaml
 
 kubectl create ns mattermost-operator
-#make build-image
-#kind load docker-image mattermost/mattermost-operator:test
-kubectl apply -n mattermost-operator -f https://raw.githubusercontent.com/mattermost/mattermost-operator/master/docs/mattermost-operator/mattermost-operator.yaml
+make build-image
+kind load docker-image mattermost/mattermost-operator:test
+kubectl apply -n mattermost-operator -f <(cat ./docs/mattermost-operator/mattermost-operator.yaml | sed -e 's|image: mattermost/mattermost-operator:latest|image: mattermost/mattermost-operator:test|g')
+#kubectl apply -n mattermost-operator -f https://raw.githubusercontent.com/mattermost/mattermost-operator/master/docs/mattermost-operator/mattermost-operator.yaml
 
 # nginx
 kubectl create ns ingress-nginx
