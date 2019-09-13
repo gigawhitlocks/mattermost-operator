@@ -198,6 +198,36 @@ func (r *ReconcileClusterInstallation) checkMattermostDeployment(mattermost *mat
 	return nil
 }
 
+func (r *ReconcileClusterInstallation) launchUpdateJob(mi *mattermostv1alpha1.ClusterInstallation, new *appsv1.Deployment, imageName string, reqLogger logr.Logger) error {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      updateName,
+			Namespace: mi.GetNamespace(),
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": updateName},
+				},
+				Spec: *new.Spec.Template.Spec.DeepCopy(),
+			},
+		},
+	}
+
+	// Override values for job-specific behavior.
+	job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
+	for i := range job.Spec.Template.Spec.Containers {
+		job.Spec.Template.Spec.Containers[i].Command = []string{"mattermost", "version"}
+	}
+
+	err := r.client.Create(context.TODO(), job)
+	if err != nil && !k8sErrors.IsAlreadyExists(err) {
+		return err
+	}
+
+	return nil
+}
+
 // updateMattermostDeployment checks if the deployment should be updated.
 // If an update is required then the deployment spec is set to:
 // - roll forward version
@@ -223,50 +253,32 @@ func (r *ReconcileClusterInstallation) updateMattermostDeployment(mi *mattermost
 	// database migrations before altering the deployment. If this fails,
 	// we will return and not upgrade the deployment.
 	if update {
-
 		reqLogger.Info(fmt.Sprintf("Running Mattermost image %s upgrade job check", imageName))
 		alreadyRunning, err := r.fetchRunningUpdateJob(mi, reqLogger)
-		if err != nil {
+		if err != nil && k8sErrors.IsNotFound(err) {
 			reqLogger.Info("Launching update job")
-
-			job := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      updateName,
-					Namespace: mi.GetNamespace(),
-				},
-				Spec: batchv1.JobSpec{
-					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{"app": updateName},
-						},
-						Spec: *new.Spec.Template.Spec.DeepCopy(),
-					},
-				},
-			}
-
-			// Override values for job-specific behavior.
-			job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
-			for i := range job.Spec.Template.Spec.Containers {
-				job.Spec.Template.Spec.Containers[i].Command = []string{"mattermost", "version"}
-			}
-
-			err := r.client.Create(context.TODO(), job)
-			if err != nil && !k8sErrors.IsAlreadyExists(err) {
+			if err := r.launchUpdateJob(mi, new, imageName, reqLogger); err != nil {
+				reqLogger.Error(err, "Launching update job failed")
 				return err
+			} else {
+				return errors.New("Began update job")
 			}
+		}
 
-			return errors.New("Started an update!")
+		if err != nil {
+			reqLogger.Error(err, "Error trying to determine if an update job already is running")
+			return err
 		}
 
 		// job is done, schedule cleanup
 		if alreadyRunning.Status.CompletionTime != nil {
 			defer func() {
-				reqLogger.Info(fmt.Sprintf("XXX Cleanup routine called %s", alreadyRunning.GetName()))
+				reqLogger.Info(fmt.Sprintf("Deleting job pod %s <%s %s>", alreadyRunning.GetName(),
+					alreadyRunning.GetNamespace(), alreadyRunning.GetSelfLink()))
 				err = r.client.Delete(context.TODO(), alreadyRunning)
 				if err != nil {
 					reqLogger.Error(err, "Unable to cleanup image update check job")
 				}
-				reqLogger.Info("Cleaned up job, ostensibly XXX")
 			}()
 		} else {
 			return errors.New("Update image job still running...")
