@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"time"
 
 	objectMatcher "github.com/banzaicloud/k8s-objectmatcher/patch"
 	"github.com/go-logr/logr"
@@ -19,6 +18,8 @@ import (
 
 	mattermostv1alpha1 "github.com/mattermost/mattermost-operator/pkg/apis/mattermost/v1alpha1"
 )
+
+const updateName = "mattermost-update-check"
 
 func (r *ReconcileClusterInstallation) checkMattermost(mattermost *mattermostv1alpha1.ClusterInstallation, reqLogger logr.Logger) error {
 	reqLogger = reqLogger.WithValues("Reconcile", "mattermost")
@@ -222,90 +223,90 @@ func (r *ReconcileClusterInstallation) updateMattermostDeployment(mi *mattermost
 	// database migrations before altering the deployment. If this fails,
 	// we will return and not upgrade the deployment.
 	if update {
+
 		reqLogger.Info(fmt.Sprintf("Running Mattermost image %s upgrade job check", imageName))
+		alreadyRunning, err := r.fetchRunningUpdateJob(mi, reqLogger)
+		if err != nil {
+			reqLogger.Info("Launching update job")
 
-		updateName := "mattermost-update-check"
-		job := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      updateName,
-				Namespace: mi.GetNamespace(),
-			},
-			Spec: batchv1.JobSpec{
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{"app": updateName},
-					},
-					Spec: *new.Spec.Template.Spec.DeepCopy(),
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      updateName,
+					Namespace: mi.GetNamespace(),
 				},
-			},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": updateName},
+						},
+						Spec: *new.Spec.Template.Spec.DeepCopy(),
+					},
+				},
+			}
+
+			// Override values for job-specific behavior.
+			job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
+			for i := range job.Spec.Template.Spec.Containers {
+				job.Spec.Template.Spec.Containers[i].Command = []string{"mattermost", "version"}
+			}
+
+			err := r.client.Create(context.TODO(), job)
+			if err != nil && !k8sErrors.IsAlreadyExists(err) {
+				return err
+			}
+
+			return errors.New("Started an update!")
 		}
 
-		// Override values for job-specific behavior.
-		job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
-		for i := range job.Spec.Template.Spec.Containers {
-			job.Spec.Template.Spec.Containers[i].Command = []string{"mattermost", "version"}
+		// job is done, schedule cleanup
+		if alreadyRunning.Status.CompletionTime != nil {
+			defer func() {
+				reqLogger.Info(fmt.Sprintf("XXX Cleanup routine called %s", alreadyRunning.GetName()))
+				err = r.client.Delete(context.TODO(), alreadyRunning)
+				if err != nil {
+					reqLogger.Error(err, "Unable to cleanup image update check job")
+				}
+				reqLogger.Info("Cleaned up job, ostensibly XXX")
+			}()
+		} else {
+			return errors.New("Update image job still running...")
 		}
 
-		err := r.client.Create(context.TODO(), job)
-		if err != nil && !k8sErrors.IsAlreadyExists(err) {
+		// it's done, it either failed or succeded
+
+		if alreadyRunning.Status.Failed > 0 {
+			err = errors.New("Upgrade job failed")
 			return err
 		}
-		defer func() {
-			err = r.client.Delete(context.TODO(), job)
-			if err != nil {
-				reqLogger.Error(err, "Unable to cleanup image update check job")
-			}
-		}()
 
-		// Wait up to 60 seconds for the update check job to return successfully.
-		timer := time.NewTimer(60 * time.Second)
-		defer timer.Stop()
+		reqLogger.Info("Upgrade image job ran successfully")
 
-	upgradeJobCheck:
-		for {
-			select {
-			case <-timer.C:
-				return errors.New("timed out waiting for mattermost image update check job to succeed")
-			default:
-				foundJob := &batchv1.Job{}
-				err = r.client.Get(
-					context.TODO(),
-					types.NamespacedName{
-						Name:      updateName,
-						Namespace: mi.GetNamespace(),
-					},
-					foundJob,
-				)
-				if err != nil {
-					continue
-				}
-				if foundJob.Status.Failed > 0 {
-					return errors.New("Upgrade image job check failed")
-				}
-				if foundJob.Status.Succeeded > 0 {
-					break upgradeJobCheck
-				}
-
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}
-
-	reqLogger.Info("Upgrade image job ran successfully")
-
-	patchResult, err := objectMatcher.DefaultPatchMaker.Calculate(original, new)
-	if err != nil {
-		return errors.Wrap(err, "error checking the difference in the deployment")
-	}
-
-	if !patchResult.IsEmpty() {
-		err := objectMatcher.DefaultAnnotator.SetLastAppliedAnnotation(new)
+		patchResult, err := objectMatcher.DefaultPatchMaker.Calculate(original, new)
 		if err != nil {
-			return errors.Wrap(err, "error applying the annotation in the deployment")
+			return errors.Wrap(err, "error checking the difference in the deployment")
 		}
 
-		return r.client.Update(context.TODO(), new)
-	}
+		if !patchResult.IsEmpty() {
+			err := objectMatcher.DefaultAnnotator.SetLastAppliedAnnotation(new)
+			if err != nil {
+				return errors.Wrap(err, "error applying the annotation in the deployment")
+			}
 
+			return r.client.Update(context.TODO(), new)
+		}
+	}
 	return nil
+}
+
+func (r *ReconcileClusterInstallation) fetchRunningUpdateJob(mi *mattermostv1alpha1.ClusterInstallation, reqLogger logr.Logger) (job *batchv1.Job, err error) {
+	foundJob := &batchv1.Job{}
+	err = r.client.Get(
+		context.TODO(),
+		types.NamespacedName{
+			Name:      updateName,
+			Namespace: mi.GetNamespace(),
+		},
+		foundJob,
+	)
+	return foundJob, err
 }
