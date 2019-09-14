@@ -14,7 +14,9 @@ import (
 	v1beta1 "k8s.io/api/extensions/v1beta1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	k8sClient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	mattermostv1alpha1 "github.com/mattermost/mattermost-operator/pkg/apis/mattermost/v1alpha1"
 )
@@ -273,11 +275,29 @@ func (r *ReconcileClusterInstallation) updateMattermostDeployment(mi *mattermost
 		// job is done, schedule cleanup
 		if alreadyRunning.Status.CompletionTime != nil {
 			defer func() {
-				reqLogger.Info(fmt.Sprintf("Deleting job pod %s <%s %s>", alreadyRunning.GetName(),
-					alreadyRunning.GetNamespace(), alreadyRunning.GetSelfLink()))
+				reqLogger.Info(fmt.Sprintf("Deleting job %s/%s",
+					alreadyRunning.GetNamespace(), alreadyRunning.GetName()))
+
 				err = r.client.Delete(context.TODO(), alreadyRunning)
 				if err != nil {
 					reqLogger.Error(err, "Unable to cleanup image update check job")
+				}
+
+				podList := &corev1.PodList{}
+				listOptions := k8sClient.ListOptions{
+					LabelSelector: labels.SelectorFromSet(
+						labels.Set(map[string]string{"app": updateName})),
+					Namespace: alreadyRunning.GetNamespace(),
+				}
+
+				err = r.client.List(context.Background(), &listOptions, podList)
+				reqLogger.Info(fmt.Sprintf("Deleting %d pods", len(podList.Items)))
+				for _, p := range podList.Items {
+					reqLogger.Info(fmt.Sprintf("Deleting pod %s/%s", p.Namespace, p.Name))
+					err = r.client.Delete(context.TODO(), &p)
+					if err != nil {
+						reqLogger.Error(err, "Problem deleting pod %s", p)
+					}
 				}
 			}()
 		} else {
